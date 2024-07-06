@@ -1,0 +1,444 @@
+---
+title: "Short-term Stock Predictions Using ML Models"
+author: "Daren Aguilera"
+date: "2024-03-23"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Short-term Stock Market Predictions of Apple
+
+```{r, message=FALSE}
+library(naniar)
+library(ggplot2)
+library(quantmod)
+library(tidymodels)
+library(tidyverse)
+library(glmnet)
+library(corrplot) # for a correlation plot
+library(modeldata)
+library(yardstick)
+library(tune)
+library(dials)
+library(ggthemes)
+library(janitor)
+library(xgboost)
+library(ranger)
+library(vip)
+library(car)
+tidymodels_prefer()
+```
+
+## Introduction
+
+We will be performing short-term stock predictions for current top technological company listed on the stock market index S&P 500.
+
+**Research Question: How do different do we use historical data of stock market price movements to predict future prices?**
+
+The S&P 500, or Standard & Poor's 500, is a stock market index that measures the stock performance of 500 of the largest companies listed on the U.S. stock exchange. It is widely regarded as one of the best single gauges of large-cap U.S. equities. The S&P 500 is important because it provides investors with a snapshot of the overall market's health and the economic performance of the leading companies across various industries. It is also used as a benchmark for investment performance, with many mutual funds and exchange-traded funds (ETFs) attempting to mimic its performance.
+
+The focus of this project is on the Apple listing within the S&P 500, they are involved in many aspects of technological research, development, and distribution of technologically based goods and services. The inclusion of the tech sector is of particular interest due to its rapid growth, innovation, and significant impact on the global economy, although here we will only start with analyzing one company.
+
+For the purpose of this project, we have selected one but the most prominent company within the tech sector of the S&P 500, known not only for their size and market influence but also for their innovative capabilities and role in shaping the future of technology.
+
+A brief overview Apple Inc. (AAPL) is a leader in consumer electronics, software, and services. Apple is best known for its iPhone, iPad, and Mac computers. The company's integration of hardware, software, and services has established a loyal customer base and made it a key player in the tech industry.
+
+This project aims to explore and compare the predictability of short-term price movements using historical data, providing insights into behaviors within the stock market and the tech sector's dynamics.
+
+There are 3 primary goals to this analysis. They are:
+
+-   Understand Historical Price Movements by Performing an Exploratory Data Analysis (EDA)
+-   Develop Predictive Models & Evaluate Their Performance
+-   Compare Predictability Across Models
+
+## Data citation
+
+This data used was gathered from Yahoo Finances accessing and downloading historical data from the top five performing technology companies, as listed [here](https://finance.yahoo.com/u/yahoo-finance/watchlists/tech-stocks-that-move-the-market).
+
+We will begin with loading our dataset. Here we use the downloaded CSV for stock market data acquired from the Yahoo Finance website.
+
+```{r, message=FALSE}
+# Loading our dataset from a csv directly off the website 
+apple <- read_csv("C:/Users/seren/Downloads/S&P Tech Company Stock Data/data/AAPL.csv")
+
+# Load our codebook we created for feature descriptions
+stock_codebook <- read_csv("C:/Users/seren/Downloads/stock_codebook")
+```
+
+We have extracted the raw data from the Yahoo Finance website, although we will practice working with the library `quantmod` to extract our desired data directly from Yahoo while staying within our R environment!
+
+```{r}
+# Using the library 'quantmod' we have access to the function 'getSymbols' where we: 
+## specify the ticker as represented on the market, specify our data source as Yahoo, 
+## and the desired range of dates. 
+data <- getSymbols("AAPL", src="yahoo", from="2023-03-01", to="2024-03-01", auto.assign=FALSE)
+
+# Let's store our data into a data frame for appropriate usage 
+apple = data.frame(date = index(data), data, row.names=NULL)
+```
+
+Now let's take a slight look into the data we will be working with in this project.
+
+```{r}
+head(apple)
+```
+
+We notice that there are 7 variables in our dataframe: date, AAPL.Open, AAPL.High, AAPL.Low, AAPL.Close, AAPL.Volume, and AAPL.Adjusted. What these variables directly indicate relative to the stock market is present in our code book. Although the data it comes with is very informative, we can create additional variables later on that will also be able to help us with the goal of outcome prediction. First, let's make sure to address any potential missing values before we continue to move forward further.
+
+```{r}
+# Check for missing values using the naniar library
+apple %>% is_na()
+
+## Note: the base 'is.na' function returns a list of the same sized matrix as the input variable, naniar makes it much cleaner to check for missing values over many cells. 
+```
+
+With no missing values in any of our datasets, we can proceed with the analysis. This was fairly expected as we extracted the dataset from Yahoo Finances and the S&P index keeps a very consistent record of observations throughout time, which is great for working with a tidy dataset. Although we will take the time to acknowledge `vis_miss()` as a great way to visualize any missing data.
+
+Now let's practice creating a general function that would be applicable to other companies if we so choose to do so later, although for now we will stick with working around Apple data. `quantmod` has a function called `periodReturn` that when given a set of prices, it will return us discrete financial earnings for the periods that we specify. Since we plan to bind this data as a new column to our primary dataset, we will specify daily returns to match the number of observations avoiding any missing values.
+
+```{r}
+returns <- function(ticker, start_year) 
+  {
+    symbol <- getSymbols(ticker, src = 'yahoo', from="2023-03-01", to="2024-03-01", auto.assign = FALSE, warnings = FALSE)
+    data <- periodReturn(symbol, period = 'daily', subset=paste(start_year, "::", sep = ""), type = 'log')
+    assign(ticker, data, .GlobalEnv)
+  }
+re = returns('AAPL', '2023-03-01')
+
+# Bind calculated daily returns as a new column 
+apple <- bind_cols(apple, re)
+```
+
+```{r Return Histogram}
+hist(re, main= "Return on Investment for AAPL", xlab="Rate of Return")
+lines(density(re), col = "red")
+```
+
+Now, similar to the 'Smarket' dataset from lab 3, it would be very helpful to work with a factor variable that addresses the direction of the calculated periodic return. We will name this variable Direction as from the original lab.
+
+```{r}
+apple <- apple %>% mutate(
+  Direction = ifelse(
+    daily.returns > 0, 'Up', 'Down')
+  )
+# Establish the new variable as a factor 
+apple$Direction <- apple$Direction %>% factor()
+```
+
+Let's check again for any missing values again now that we've added two variables.
+
+```{r}
+apple %>% is_na()
+```
+
+## Splitting data
+
+Now that we have added our additional variables and see that there is no missing values, we can go into splitting our data. Although since our goal is predicting the adjusted closing value, we will stratify our training and testing set on this variable, although ideally for a more accurate analysis of time series data, we would use a chronological method of stratifying. Unfortunately we are not entirely well-versed in time series and have not taken PSTAT 174, although with all of this considered, we will still aim to predict the adjusted closing value and learn some new things on the way while applying core concepts of statistical machine learning!
+
+```{r}
+# Split training and testing data 
+stock_split <- initial_split(apple, prop = 0.75, strata = AAPL.Adjusted)
+apple_train <- training(stock_split)
+apple_test <- testing(stock_split)
+```
+
+### Cross-validation
+
+We are going to use the `vfold_cv` function to establish a k amount of folds our of apple stock market data. K-fold cross-validation is a resampling method that will divide our data into a k amount of groups (or subsets) of an approximately equal size. This process allows us to more fully utilize our data given to create multiple, suitable models from partitions of our training set, and then adjusting them to the relative fold initially excluded to create multiple estimations within the single training data we collected. This gives us a better interpretation of our training data by evaluating the available data much more thoroughly, as opposed to creating a single model in one step based entirely off our entire training data. We will be setting our amount of folds to five (k = 5), giving us a better model than we would otherwise without folding our subsets too small.
+
+```{r}
+# With vfold_cv we set our value of k as v within the syntax of this function
+stock_folds <- vfold_cv(apple_train, v = 5)
+```
+
+## Exploratory Data Analysis
+
+Now that we have introduced and pre-processed our data, we will begin moving forward to our Exploratory Data Analysis.
+
+The very first thing we will do is take a look at a statistical summary of our data to familiarize ourselves with the variables.
+
+```{r}
+summary(apple_train)
+```
+
+Without plotting anything we notice that our newly added factor variable 'Direction' is distributed nearly symmetrically, with 96 counts of 'Down' and 92 counts of 'Up'.
+
+We quickly notice that the Volume variable has an extremely large range of values. We should inspect this further to provide a better visualization of the data since the summary does not give us a very informative representation. We will create a bar plot of to inspect the volume of the Volume variable.
+
+```{r}
+apple %>%
+    ggplot(aes(x = date, y = AAPL.Volume)) +
+    geom_segment(aes(xend = date, yend = 0, color = AAPL.Volume)) + 
+    geom_smooth(method = "loess", se = FALSE) +
+    labs(title = "AAPL Volume Chart", 
+         subtitle = "Charting Daily Volume", 
+         y = "Volume", x = "") +
+    theme(legend.position = "none") 
+```
+
+From the graph above, we get a lot of high jumps in volume, but see when roughly smoothed out that it remains pretty uniform. From this we see that a lot of stock quantity goes through apples with periodic changes, although this would not be very helpful in our predictive model since it does not appear the value of the stock largely depends on the Volume for Apple.
+
+Now since our primary goal is predicting the adjusted closing price, let us take a look at a simple scatter plot of the ordinary closing price plotted along the date to observe time progression.
+
+```{r}
+# Plot of closing prices over the time period
+plot(apple_train$AAPL.Close,
+     main = "Closing Prices of AAPL over the past 12 months",
+     ylab="Apple Close Price", x=apple_train$date, xlab="Date")
+```
+
+We see a pretty consistent progression of the closing price over a year.
+
+Now let us compare this to the **adjusted** closing price.
+
+```{r}
+# Plot of the adjusted closing prices 
+plot(apple_train$AAPL.Adjusted, main = "Adjusted Closing Prices of AAPL from over the past 12 months", ylab="Adjusted Close Price", x=apple_train$date, xlab="Date")
+```
+
+We can see that both distributions match up with each other well, signifying not much adjustment was made on the stock after accounting for dividend disbursements and other adjustments. Although we can consider this expected and pretty good for us that there were no huge readjustments by Apple.
+
+Although because of this strong similarity, that warrants the case for a strong covariance between these two variables, let's conduct a correlation plot to investigate covariation within all of our numeric variables.
+
+```{r}
+apple_train %>% 
+  select(-Direction, -date) %>% 
+  cor() %>% 
+  corrplot(method = 'square', type = 'lower')
+```
+
+The amount of correlation between the variables is expected for our data given the financial values and their strong relationship with one another. This **must** be taken into account moving forward when building our predictive model.
+
+Finally let us experiment with some of the graphic opportunities provided to us with the `quantmod` library. We will use a nice and informative plot from the function `chartSeries` with only a few lines of code, a great library to use with quantitative analysis of financial markets. This will appear as a candle chart that provides small box plots in increments to measure progressive variation in closing prices to help us detect movement.
+
+We'll also include the function `addMACD` with default parameters, this will show us the Moving Average Convergence Divergence (MACD).
+
+```{r chartSeries}
+chartSeries(data,
+            TA = c(addMACD()), # Moving Average Convergence Divergence
+            theme= chartTheme("black"), # Black was the best for visual display
+            name='AAPL (From March 2023 to February 2024)') # Our time frame
+```
+
+MACD triggers technical signals when it crosses above (to buy) or below (to sell) its signal line. The speed of crossovers is also taken as a signal of a market is overbought or oversold.
+
+Although we will not be using this in our prediction, it is an important metric to evaluate our data when making real-time decisions through reinforcement learning.
+
+## Recipe Building
+
+```{r}
+# Build our recipe for predicting the closing bid/put price.
+stock_recipe <- recipe(AAPL.Adjusted ~ . , data = apple_train) %>%
+  # Using the step_date function to convert our date into general months
+  step_date(date, features = c("month"),
+            # Drop the original date column
+            keep_original_cols = FALSE) %>%
+  step_rm(AAPL.Close) %>%
+  # Encode our factor variables of day, month, and direction 
+  step_dummy(all_nominal_predictors()) %>%
+  # Zv will remove columns from the data with a single value, i.e. zero variance
+  step_zv(all_predictors()) %>%
+  # Standardize predictors with steps center and scale   
+  step_center(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors()) 
+
+
+stock_recipe %>% prep() %>% bake(new_data = apple_train)
+```
+
+## Workflow setup
+
+Let us begin to set up the appropriate workflows for the models we are going to fit our data to.
+
+We will start with the simpler models and workflows for linear regression and KNN with tuning for neighbors.
+
+```{r}
+#k-nearest neighbors with the kknn engine, tuning neighbors;
+stock_knn_mod_cv <- nearest_neighbor(
+  neighbors = tune()) %>%
+  set_mode("regression") %>%
+  set_engine("kknn")
+
+stock_knn_wkflow_cv <- workflow() %>% 
+  add_model(stock_knn_mod_cv) %>% 
+  add_recipe(stock_recipe)
+
+# set up grid for knn model, where neighbors were tuned
+knn_grid <- grid_regular(neighbors(range = c(1, 10)),
+                         levels = 10)
+
+# linear regression;
+stock_lm_mod <- linear_reg() %>%
+  set_mode("regression") %>%
+  set_engine("lm")
+
+stock_lm_wkflow <- workflow() %>% 
+  add_model(stock_lm_mod) %>% 
+  add_recipe(stock_recipe)
+```
+
+Next we'll work on the more complicated models with multiple parameters to tune for. These will be an elastic net regression model and random forest. First we will begin with the elastic net and setting up the workflow.
+
+```{r}
+# Set up our models and workflow for elastic net regression 
+en_spec_stock <- linear_reg(penalty = tune(),  # tune for penalty 
+                            mixture = tune())%>%  #tune for mixture
+  set_mode("regression") %>%
+  set_engine("glmnet")
+
+en_workflow_stock <- workflow() %>% 
+  add_recipe(stock_recipe) %>% 
+  add_model(en_spec_stock)
+```
+
+Since we know we will be having to tune our hyperparameters on a grid, we'll also get that set up to keep the model building process together and not too separated between each other with individual steps. Since we do not want to run this on the log scale, we'll use `identity_trains()` with our penalty ranging from 0 to 1, especially since we have factor variables that span over a small magnitude. It is also important to remember that we have standardized our predictors, so setting a wider range might give us errors.
+
+```{r}
+# Set up our grid for EN regression and range to tune hyperparameters
+en_grid_stock <- grid_regular(penalty(range = c(0,1),
+                                      trans = identity_trans()),
+                                mixture(range = c(0,1)),
+                                levels = 10)
+```
+
+Now for our random forest model, we will be tuning our parameters `mtry`, `trees`, and `min_n`. Additionally we will be using `importance = 'impurity'` so we can store variable importance information.
+
+```{r}
+# Set up our model for random forest 
+rf_reg_spec <- rand_forest(mtry = tune(), 
+                           trees = tune(), 
+                           min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("regression")
+
+rf_reg_wf <- workflow() %>% 
+  add_model(rf_reg_spec) %>% 
+  add_recipe(stock_recipe)
+
+# Set up our grid for random forest with tuning parameters
+rf_grid <- grid_regular(mtry(range = c(1, 8)), 
+                        trees(range = c(100, 500)),
+                        min_n(range = c(10, 20)),
+                        levels = 5)
+```
+
+## Model Fitting
+
+We will now begin to fit all of our models, starting with the linear model.
+
+```{r}
+# fit linear model to folded data 
+stock_lm_fit <- stock_lm_wkflow %>%
+  fit(data = apple_train)
+```
+
+Now tuning our grid for neighbors and resampling our folded data from earlier, applying it to our KNN model and workflow.
+
+```{r, message = FALSE}
+# fit knn model to folded data 
+knn_tune_stock <- tune_grid(
+  object = stock_knn_wkflow_cv,  
+  resamples = stock_folds, 
+  grid = knn_grid,
+  control = control_grid(verbose = TRUE)
+)
+```
+
+Then our elastic net grid tuned for penalty and mixture across folds.
+
+```{r, message = FALSE}
+#Fit all models to folded data using tune_grid().
+en_tune_stock <- tune_grid(
+  en_workflow_stock,
+  resamples = stock_folds,
+  grid = en_grid_stock,
+  control = control_grid(verbose = TRUE)
+)
+```
+
+Then our random forest grid tuned for mtry, trees, and min_n across folds.
+
+```{r, message = FALSE}
+rf_tune_stock <- tune_grid(
+  rf_reg_wf,
+  resamples = stock_folds,
+  grid = rf_grid,
+  control = control_grid(verbose = TRUE)
+)
+```
+
+Let's save our random forest model to a file we can load for later to reduce the amount of times we need to run this model.
+
+```{r}
+save(rf_tune_stock, file = "rf_tune_stock.rda")
+load("rf_tune_stock.rda")
+```
+
+Now we will check the results of our KNN model by autoplotting it to observe the R-squared and RMSE metric results.
+
+```{r}
+autoplot(knn_tune_stock)
+```
+
+Then observe the three best models (just to get a comparitive aspect, we'll only use the best one).
+
+```{r}
+show_best(knn_tune_stock,metric = 'rsq', n=3)
+best_knn_stock <- select_best(knn_tune_stock, metric = 'rsq')
+```
+
+Now we may auto plot the results of our elastic net model, return the three best in terms of R-squared, and then save the best one into a new variable.
+
+```{r}
+autoplot(en_tune_stock)
+
+show_best(en_tune_stock,metric = 'rsq', n=3)
+best_en_stock <- select_best(en_tune_stock, metric = 'rsq')
+```
+
+Let us plot the results of our tuned random forest model and do the same as above.
+
+```{r}
+autoplot(rf_tune_stock) + theme_minimal()
+
+show_best(rf_tune_stock,metric = 'rsq', n=3)
+best_rf_stock <- select_best(rf_tune_stock, metric = 'rsq')
+```
+
+Going through all of the best models after fitting them. The most accurate model we achieved was with the elastic net regression. Using the R-squared value as the metric, we achieve 0.9997596, with a penalty of 0.6666667 and a mixture of 1.
+
+## Best Model Testing
+
+Since we have finalized our best model to our elastic net regression, we will also finalize the workflow and update the tuned parameters with the best model that we got.
+
+```{r}
+en_final_stock <- finalize_workflow(en_workflow_stock,
+                                      best_en_stock)
+
+en_final_stock <- fit(en_final_stock, 
+                        data = apple_train)
+
+augment(en_final_stock, new_data = apple_test) %>%
+  rsq(truth = AAPL.Adjusted, estimate = .pred)
+```
+
+We achieved an R-squared value of 0.99248 on our final test set.
+
+## Conclusion
+
+In this project, we embarked on the challenging yet insightful task of predicting short-term stock price movements for Apple Inc., a leading technological giant in the S&P 500. The goal was to leverage historical stock data to uncover patterns and construct predictive models that could guide future investment decisions.
+
+In the marketplace of ideas and strategies, our exploratory data analysis (EDA) served as the compass. It guided us through the historical flow of Apple's stock prices, revealing a insight to the public data accessible to the everyone.
+
+From the seed of understanding planted during EDA sprouted our modeling efforts. We cultivated a variety of statistical models, each with its promise and each with its own tale of complexity. Among these, the elastic net regression model emerged as a formidable predictor, boasting an R-squared value that may likely be suspiciously close to over fitting. Although this was achived due to the meticulous tuning of its parameters and the validation that each fold of data underwent.
+
+The true testament of our analytics was in the confrontation with reality—the testing set. Here, our chosen champion, the elastic net regression model, showed to be the best with an R-squared value of 0.99248. Such a score in the testing arena validated our approach in the predictive prowess of the model, although further analysis will be required to truly test these models and identify other misfits.
+
+However, our study is not without limitations. The models were developed based solely on historical price data, without considering external factors such as market sentiment, economic indicators, or geopolitical events, which can significantly influence stock prices. Furthermore, the project's scope was limited to a single company and a short time frame, which may not capture broader market trends or sector-wide movements.
+
+Future research could expand on our work by incorporating a wider array of predictive factors, extending the analysis to a broader set of companies, and exploring the predictive power over different time horizons. Additionally, employing more sophisticated time series models and deep learning approaches could unveil further subtleties in stock price movements.
+
+Overall, this project has demonstrated the powerful capabilities of statistical learning in the realm of financial analysis. The knowledge and experience gained from this endeavor will undoubtedly serve as a solid foundation for more advanced explorations into the complexity of the stock landscape.
